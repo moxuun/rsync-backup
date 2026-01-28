@@ -1,130 +1,140 @@
 #!/bin/bash
 
 # =================================================================
-# VPS -> NAS 自动备份脚本 (Rsync 版 + 迁移模式)
+# VPS -> NAS 自动备份脚本 (v5)
 # =================================================================
 
-# --- 0. 模式控制 ---
+# --- 1. 基础配置 ---
 # 如果设为 "true"，则只在本地打包，不连接 NAS，不执行同步和远程清理
 MIGRATION_ONLY="false"
-
-# --- 1. NAS 配置 ---
+# NAS 登录用户名、IP、目标备份目录
 NAS_USER="admin"
 NAS_HOST="192.168.1.2"
 NAS_TARGET_DIR="/mnt/Storage1/vps"
-
-# --- 2. 本地配置 ---
+# 本地临时备份保存目录
 LOCAL_TEMP_ROOT="/tmp/vps_backups"
 
-# --- 3. 容器配置 (备份期间需要暂停的容器) ---
-# 确保包含数据库容器，以保证数据一致性
-CONTAINERS_TO_STOP="nginx"
+# 备份保留天数
+RETENTION_DAYS=30
 
-# --- 4. 需要备份的内容 ---
+# --- 2. 备份对象 ---
+CONTAINERS_TO_STOP="nginx"
 VOLUMES_TO_BACKUP=""
 DIRS_TO_BACKUP="/opt/nginx"
 
-# --- 5. 远程保留策略 ---
-RETENTION_DAYS=30
+# --- 3. Telegram 配置 ---
+TG_BOT_TOKEN="你的_BOT_TOKEN"
+TG_CHAT_ID="你的_CHAT_ID"
 
 # -----------------------------------------------------------------
 
 export TZ='Asia/Shanghai'
 DATE=$(date +%Y%m%d_%H%M%S)
-BACKUP_NAME="${DATE}"
-LOCAL_BACKUP_DIR="${LOCAL_TEMP_ROOT}/${BACKUP_NAME}"
+HOSTNAME=$(hostname)
+LOCAL_BACKUP_DIR="${LOCAL_TEMP_ROOT}/${DATE}"
+REPORT_DETAILS="" # 用于收集备份过程中的详细信息
 
-echo "====================================="
-echo "[开始] 任务启动: $(date)"
+# --- 核心通知函数 ---
+# 使用 --data-urlencode 解决复杂字符和换行问题
+send_notification() {
+    local status_icon="$1"
+    local title="$2"
+    local content="$3"
+    
+    # 构造 HTML 文本，使用 <b> 替代 * 避免下划线解析错误
+    local full_message="${status_icon} <b>${title}</b> (${HOSTNAME})
+---------------------------
+${content}"
 
-# 0. 预检查: 只有在非迁移模式下才测试 SSH 连接
+    if [ -n "${TG_BOT_TOKEN}" ] && [ -n "${TG_CHAT_ID}" ]; then
+        curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+            -d "chat_id=${TG_CHAT_ID}" \
+            -d "parse_mode=HTML" \
+            --data-urlencode "text=${full_message}" > /dev/null
+    fi
+}
+
+echo "--- 任务启动: ${DATE} ---"
+
+# 0. 环境预检查
 if [ "$MIGRATION_ONLY" != "true" ]; then
-    echo "[模式] Rsync over SSH (Target: ${NAS_HOST})"
-    ssh -q -o BatchMode=yes -o ConnectTimeout=5 "${NAS_USER}@${NAS_HOST}" exit
-    if [ $? -ne 0 ]; then
-        echo "[致命错误] 无法连接到 NAS (${NAS_HOST})。请检查网络或密钥设置。"
+    if ! ssh -q -o BatchMode=yes -o ConnectTimeout=5 "${NAS_USER}@${NAS_HOST}" exit; then
+        send_notification "❌" "备份中止" "原因: 无法通过 SSH 连接到 NAS (${NAS_HOST})"
         exit 1
     fi
-else
-    echo "[模式] 临时迁移模式 (仅本地打包，不执行远程同步)"
 fi
 
-# 1. 准备本地临时目录
+# 1. 目录准备
 mkdir -p "${LOCAL_BACKUP_DIR}"
 
-# 2. 停止关键容器 (冷备份模式)
+# 2. 停止容器 (冷备份)
 if [ -n "${CONTAINERS_TO_STOP}" ]; then
-    echo ">> [Step 1] 暂停关键容器..."
-    docker stop ${CONTAINERS_TO_STOP}
+    echo ">> 正在停止容器: ${CONTAINERS_TO_STOP}"
+    docker stop ${CONTAINERS_TO_STOP} > /dev/null
 fi
 
 # 3. 打包 Docker 卷
-if [ -n "${VOLUMES_TO_BACKUP}" ]; then
-    echo ">> [Step 2] 打包 Docker 数据卷..."
-    for VOLUME in ${VOLUMES_TO_BACKUP}; do
-        if docker volume inspect "${VOLUME}" > /dev/null 2>&1; then
-            docker run --rm \
-                -v "${VOLUME}:/source_data:ro" \
-                -v "${LOCAL_BACKUP_DIR}:/backup_target" \
-                alpine tar -czf "/backup_target/${VOLUME}.tar.gz" -C /source_data .
-            echo "   - 卷 ${VOLUME} 已打包"
-        else
-            echo "   ! 警告: 卷 ${VOLUME} 不存在，跳过"
-        fi
-    done
-fi
+for VOLUME in ${VOLUMES_TO_BACKUP}; do
+    if docker volume inspect "${VOLUME}" > /dev/null 2>&1; then
+        docker run --rm -v "${VOLUME}:/source_data:ro" -v "${LOCAL_BACKUP_DIR}:/target" \
+            alpine tar -czf "/target/vol_${VOLUME}.tar.gz" -C /source_data .
+        # 使用换行符替代 \n 确保在 TG 中正确换行
+        REPORT_DETAILS="${REPORT_DETAILS}✅ 卷: ${VOLUME}
+"
+    else
+        REPORT_DETAILS="${REPORT_DETAILS}⚠️ 卷不存在: ${VOLUME}
+"
+    fi
+done
 
-# 4. 打包普通文件夹
-if [ -n "${DIRS_TO_BACKUP}" ]; then
-    echo ">> [Step 3] 打包指定文件夹..."
-    for DIR_PATH in ${DIRS_TO_BACKUP}; do
-        if [ -d "${DIR_PATH}" ]; then
-            DIR_NAME=$(basename "${DIR_PATH}")
-            cd "$(dirname "${DIR_PATH}")" && \
-            tar -czf "${LOCAL_BACKUP_DIR}/${DIR_NAME}_folder.tar.gz" --exclude='logs' "${DIR_NAME}"
-            echo "   - 目录 ${DIR_PATH} 已打包"
-        else
-            echo "   ! 警告: 目录 ${DIR_PATH} 不存在，跳过"
-        fi
-    done
-fi
+# 4. 打包物理文件夹
+for DIR in ${DIRS_TO_BACKUP}; do
+    if [ -d "${DIR}" ]; then
+        D_NAME=$(basename "${DIR}")
+        cd "$(dirname "${DIR}")" && tar -czf "${LOCAL_BACKUP_DIR}/dir_${D_NAME}.tar.gz" --exclude='logs' "${D_NAME}"
+        REPORT_DETAILS="${REPORT_DETAILS}✅ 目录: ${DIR}
+"
+    else
+        REPORT_DETAILS="${REPORT_DETAILS}⚠️ 目录不存在: ${DIR}
+"
+    fi
+done
 
-# 5. 立即恢复容器
+# 5. 立即恢复容器 
 if [ -n "${CONTAINERS_TO_STOP}" ]; then
-    echo ">> [Step 4] 恢复业务容器..."
-    docker start ${CONTAINERS_TO_STOP}
+    echo ">> 正在恢复容器"
+    docker start ${CONTAINERS_TO_STOP} > /dev/null
 fi
 
-# 6. 判断是执行同步还是结束任务
-if [ "$MIGRATION_ONLY" = "true" ]; then
-    echo "====================================="
-    echo "[完成] 迁移打包已结束。"
-    echo "[注意] 请手动通过 SFTP 下载此目录: ${LOCAL_BACKUP_DIR}"
-    echo "[注意] 下载完成后，请手动执行: rm -rf ${LOCAL_TEMP_ROOT}"
-else
-    # 6. Rsync 推送到 NAS
-    echo ">> [Step 5] 同步文件到 NAS..."
-    rsync -av --timeout=600 -e ssh \
-        "${LOCAL_BACKUP_DIR}" \
-        "${NAS_USER}@${NAS_HOST}:${NAS_TARGET_DIR}/"
+# 6. 计算备份统计信息
+BACKUP_SIZE=$(du -sh "${LOCAL_BACKUP_DIR}" | awk '{print $1}')
 
+# 7. 传输与远程清理
+if [ "$MIGRATION_ONLY" = "true" ]; then
+    send_notification "📦" "迁移包就绪" "大小: ${BACKUP_SIZE}
+路径: ${LOCAL_BACKUP_DIR}
+
+<b>请手动处理后续迁移</b>"
+else
+    echo ">> 同步至 NAS..."
+    rsync -av --timeout=600 "${LOCAL_BACKUP_DIR}" "${NAS_USER}@${NAS_HOST}:${NAS_TARGET_DIR}/"
+    
     if [ $? -eq 0 ]; then
-        echo "   [成功] 数据已传输至 NAS。"
-        
-        # 7. 清理本地临时文件
-        echo ">> [Step 6] 清理本地临时缓存..."
-        rm -rf "${LOCAL_TEMP_ROOT}"
-        
-        # 8. 远程清理过期备份
-        echo ">> [Step 7] 清理 NAS 上的旧备份 (保留 ${RETENTION_DAYS} 天)..."
+        # 成功后的后续操作
+        rm -rf "${LOCAL_BACKUP_DIR}"
         ssh "${NAS_USER}@${NAS_HOST}" "find ${NAS_TARGET_DIR} -maxdepth 1 -type d -name '20*' -mtime +${RETENTION_DAYS} -exec rm -rf {} \;"
         
-        echo "====================================="
-        echo "[完成] 备份任务结束: $(date)"
+        # 汇总最终报告并发送
+        SUCCESS_MSG="<b>时间:</b> ${DATE}
+<b>大小:</b> ${BACKUP_SIZE}
+<b>保留:</b> ${RETENTION_DAYS} 天
+<b>明细:</b>
+${REPORT_DETAILS}"
+        send_notification "✅" "备份成功" "${SUCCESS_MSG}"
     else
-        echo "====================================="
-        echo "[失败] Rsync 传输过程中发生错误！"
-        echo "本地备份文件仍保留在: ${LOCAL_BACKUP_DIR}"
+        send_notification "❌" "备份失败" "原因: Rsync 同步过程中出错"
         exit 1
     fi
 fi
+
+echo "--- 任务结束 ---"
